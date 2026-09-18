@@ -16,8 +16,8 @@ import {
   offersAgreements,
   sponsors,
   users,
-} from "../drizzle/schema";
-import { ENV } from "./_core/env";
+} from "../drizzle/schema.js";
+import { ENV } from "./_core/env.js";
 
 // ==========================================
 // SEED DATA FOR IN-MEMORY / FALLBACK STORAGE
