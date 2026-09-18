@@ -1,5 +1,5 @@
 import type { CreateExpressContextOptions } from "@trpc/server/adapters/express";
-import { COOKIE_NAME } from "@shared/const";
+import { COOKIE_NAME } from "../../shared/const.js";
 import { parse as parseCookieHeader } from "cookie";
 
 export type TrpcContext = {
