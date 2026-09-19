@@ -1,8 +1,15 @@
+import { supabase } from "./_core/supabase.js";
+import { TRPCError } from "@trpc/server";
 import { z } from "zod";
 import { COOKIE_NAME } from "../shared/const.js";
 import { getSessionCookieOptions } from "./_core/cookies.js";
 import { systemRouter } from "./_core/systemRouter.js";
-import { adminProcedure, protectedProcedure, publicProcedure, router } from "./_core/trpc.js";
+import {
+  adminProcedure,
+  protectedProcedure,
+  publicProcedure,
+  router,
+} from "./_core/trpc.js";
 import {
   createContact,
   createContactLog,
@@ -44,7 +51,16 @@ const sponsorInput = z.object({
   primaryEvent: z.string().optional(),
   potentialFit: z.string().optional(),
   priority: z.enum(["High", "Medium", "Low"]).default("Medium"),
-  pipelineStatus: z.enum(["Lead", "Contacted", "Meeting", "Proposal", "Confirmed", "Not a fit"]).default("Lead"),
+  pipelineStatus: z
+    .enum([
+      "Lead",
+      "Contacted",
+      "Meeting",
+      "Proposal",
+      "Confirmed",
+      "Not a fit",
+    ])
+    .default("Lead"),
   ownerId: z.number().optional(),
   lastContactDate: z.string().optional().nullable(),
   nextFollowupDate: z.string().optional().nullable(),
@@ -65,7 +81,11 @@ const contactInput = z.object({
   companyName: z.string().optional(),
   contactName: z.string().min(2, "Contact name is required"),
   roleDepartment: z.string().optional(),
-  email: z.string().email("Valid email required").optional().or(z.literal("")),
+  email: z
+    .string()
+    .email("Valid email required")
+    .optional()
+    .or(z.literal("")),
   phone: z.string().optional(),
   linkedinUrl: z.string().optional(),
   preferredContactMethod: z.string().optional(),
@@ -141,32 +161,142 @@ export const appRouter = router({
       .mutation(async ({ ctx, input }) => {
         let userToAuth: any = null;
 
+        // --------------------------------------------------
+        // CASE 1: Quick-login using an existing SponsorHub
+        // user ID.
+        //
+        // We STILL verify that this user's email exists in
+        // Supabase Authentication. This prevents the
+        // quick-login buttons from bypassing the rule.
+        // --------------------------------------------------
         if (input?.userId) {
           userToAuth = await getUserById(input.userId);
-        } else if (input?.email) {
-          userToAuth = await getUserByEmail(input.email);
+
           if (!userToAuth) {
-            // Self-service sign in: create new team member profile
-            const nameFromEmail = input.email.split("@")[0].replace(/[._]/g, " ");
+            throw new TRPCError({
+              code: "UNAUTHORIZED",
+              message: "User account not found",
+            });
+          }
+
+          if (!userToAuth.email) {
+            throw new TRPCError({
+              code: "UNAUTHORIZED",
+              message: "This user does not have an email address",
+            });
+          }
+
+          const { data, error } = await supabase.auth.admin.listUsers({
+            page: 1,
+            perPage: 1000,
+          });
+
+          if (error) {
+            console.error("Supabase Auth verification failed:", error);
+
+            throw new TRPCError({
+              code: "INTERNAL_SERVER_ERROR",
+              message: "Unable to verify account",
+            });
+          }
+
+          const supabaseUser = data.users.find(
+            (user) =>
+              user.email?.toLowerCase() === userToAuth.email.toLowerCase()
+          );
+
+          if (!supabaseUser) {
+            throw new TRPCError({
+              code: "UNAUTHORIZED",
+              message: "This email is not authorized to access SponsorHub",
+            });
+          }
+        }
+
+        // --------------------------------------------------
+        // CASE 2: Login using an email address.
+        //
+        // FIRST check Supabase Authentication.
+        // Only users whose email exists in Supabase Auth
+        // are allowed to continue.
+        // --------------------------------------------------
+        else if (input?.email) {
+          const email = input.email.trim().toLowerCase();
+
+          const { data, error } = await supabase.auth.admin.listUsers({
+            page: 1,
+            perPage: 1000,
+          });
+
+          if (error) {
+            console.error("Supabase Auth verification failed:", error);
+
+            throw new TRPCError({
+              code: "INTERNAL_SERVER_ERROR",
+              message: "Unable to verify account",
+            });
+          }
+
+          const supabaseUser = data.users.find(
+            (user) => user.email?.toLowerCase() === email
+          );
+
+          // Email does NOT exist in Supabase Auth.
+          if (!supabaseUser) {
+            throw new TRPCError({
+              code: "UNAUTHORIZED",
+              message: "This email is not authorized to access SponsorHub",
+            });
+          }
+
+          // --------------------------------------------------
+          // Supabase Auth has verified the email.
+          //
+          // Now find the corresponding SponsorHub profile.
+          // --------------------------------------------------
+          userToAuth = await getUserByEmail(email);
+
+          // --------------------------------------------------
+          // If this is the first time this authorized
+          // Supabase user is accessing SponsorHub, create
+          // their SponsorHub profile automatically.
+          // --------------------------------------------------
+          if (!userToAuth) {
+            const nameFromEmail = email
+              .split("@")[0]
+              .replace(/[._-]/g, " ")
+              .trim();
+
+            const formattedName = nameFromEmail
+              .split(" ")
+              .filter(Boolean)
+              .map(
+                (part) =>
+                  part.charAt(0).toUpperCase() + part.slice(1).toLowerCase()
+              )
+              .join(" ");
+
             userToAuth = await inviteTeamMember({
-              name: nameFromEmail.charAt(0).toUpperCase() + nameFromEmail.slice(1),
-              email: input.email,
+              name: formattedName || email.split("@")[0],
+              email,
               role: input.role ?? "user",
             });
           }
         }
 
-        // Fallback default: Aarav Kapoor (Admin)
+        // --------------------------------------------------
+        // No usable login information was supplied.
+        // --------------------------------------------------
         if (!userToAuth) {
-          userToAuth = (await getUserById(1)) || {
-            id: 1,
-            name: "Aarav Kapoor",
-            email: "aarav@club.edu.in",
-            role: "admin",
-            title: "Sponsorship & PR Lead",
-          };
+          throw new TRPCError({
+            code: "UNAUTHORIZED",
+            message: "Please provide an authorized email address",
+          });
         }
 
+        // --------------------------------------------------
+        // Create SponsorHub session cookie.
+        // --------------------------------------------------
         const cookiePayload = {
           id: userToAuth.id,
           name: userToAuth.name,
@@ -176,18 +306,29 @@ export const appRouter = router({
         };
 
         const cookieOptions = getSessionCookieOptions(ctx.req);
+
         ctx.res.cookie(COOKIE_NAME, JSON.stringify(cookiePayload), {
           ...cookieOptions,
           maxAge: 365 * 24 * 60 * 60 * 1000,
         });
 
-        return { success: true, user: cookiePayload } as const;
+        return {
+          success: true,
+          user: cookiePayload,
+        } as const;
       }),
 
     logout: publicProcedure.mutation(({ ctx }) => {
       const cookieOptions = getSessionCookieOptions(ctx.req);
-      ctx.res.clearCookie(COOKIE_NAME, { ...cookieOptions, maxAge: -1 });
-      return { success: true } as const;
+
+      ctx.res.clearCookie(COOKIE_NAME, {
+        ...cookieOptions,
+        maxAge: -1,
+      });
+
+      return {
+        success: true,
+      } as const;
     }),
   }),
 
@@ -202,7 +343,14 @@ export const appRouter = router({
             search: z.string().optional(),
             status: z.string().optional(),
             priority: z.string().optional(),
-            sortBy: z.enum(["updatedAt", "companyName", "estimatedValue", "nextFollowupDate"]).optional(),
+            sortBy: z
+              .enum([
+                "updatedAt",
+                "companyName",
+                "estimatedValue",
+                "nextFollowupDate",
+              ])
+              .optional(),
             sortOrder: z.enum(["asc", "desc"]).optional(),
           })
           .optional()
@@ -217,30 +365,38 @@ export const appRouter = router({
 
     kpis: protectedProcedure.query(() => getSponsorKpis()),
 
-    create: protectedProcedure.input(sponsorInput).mutation(async ({ ctx, input }) => {
-      const newSponsor = await createSponsor({
-        ...input,
-        displayId: input.displayId || "",
-        companyName: input.companyName,
-        estimatedValue: input.estimatedValue ?? "0",
-        nextFollowupDate: input.nextFollowupDate ? new Date(input.nextFollowupDate) : null,
-        lastContactDate: input.lastContactDate ? new Date(input.lastContactDate) : null,
-        meetingDate: input.meetingDate ? new Date(input.meetingDate) : null,
-        createdBy: ctx.user.id,
-        ownerId: input.ownerId ?? ctx.user.id,
-      });
+    create: protectedProcedure
+      .input(sponsorInput)
+      .mutation(async ({ ctx, input }) => {
+        const newSponsor = await createSponsor({
+          ...input,
+          displayId: input.displayId || "",
+          companyName: input.companyName,
+          estimatedValue: input.estimatedValue ?? "0",
+          nextFollowupDate: input.nextFollowupDate
+            ? new Date(input.nextFollowupDate)
+            : null,
+          lastContactDate: input.lastContactDate
+            ? new Date(input.lastContactDate)
+            : null,
+          meetingDate: input.meetingDate
+            ? new Date(input.meetingDate)
+            : null,
+          createdBy: ctx.user.id,
+          ownerId: input.ownerId ?? ctx.user.id,
+        });
 
-      recordUserActivity({
-        userId: ctx.user.id,
-        userName: ctx.user.name,
-        action: "Created",
-        entityType: "Sponsor",
-        entityTitle: newSponsor.companyName,
-        details: `Added ${newSponsor.companyName} (${newSponsor.displayId}) to pipeline with status ${newSponsor.pipelineStatus}`,
-      });
+        recordUserActivity({
+          userId: ctx.user.id,
+          userName: ctx.user.name,
+          action: "Created",
+          entityType: "Sponsor",
+          entityTitle: newSponsor.companyName,
+          details: `Added ${newSponsor.companyName} (${newSponsor.displayId}) to pipeline with status ${newSponsor.pipelineStatus}`,
+        });
 
-      return newSponsor;
-    }),
+        return newSponsor;
+      }),
 
     update: protectedProcedure
       .input(
@@ -251,11 +407,18 @@ export const appRouter = router({
       )
       .mutation(async ({ ctx, input }) => {
         const { id, data } = input;
+
         const updated = await updateSponsor(id, {
           ...data,
-          lastContactDate: data.lastContactDate ? new Date(data.lastContactDate) : undefined,
-          nextFollowupDate: data.nextFollowupDate ? new Date(data.nextFollowupDate) : undefined,
-          meetingDate: data.meetingDate ? new Date(data.meetingDate) : undefined,
+          lastContactDate: data.lastContactDate
+            ? new Date(data.lastContactDate)
+            : undefined,
+          nextFollowupDate: data.nextFollowupDate
+            ? new Date(data.nextFollowupDate)
+            : undefined,
+          meetingDate: data.meetingDate
+            ? new Date(data.meetingDate)
+            : undefined,
         });
 
         recordUserActivity({
@@ -281,6 +444,7 @@ export const appRouter = router({
           entityTitle: `Sponsor ID #${input.id}`,
           details: `Removed sponsor record and associated sub-items`,
         });
+
         return deleteSponsor(input.id);
       }),
   }),
@@ -298,25 +462,29 @@ export const appRouter = router({
           })
           .optional()
       )
-      .query(({ input }) => listContacts(input?.sponsorId, input?.search)),
+      .query(({ input }) =>
+        listContacts(input?.sponsorId, input?.search)
+      ),
 
-    create: protectedProcedure.input(contactInput).mutation(async ({ ctx, input }) => {
-      const contact = await createContact({
-        ...input,
-        email: input.email || null,
-      });
+    create: protectedProcedure
+      .input(contactInput)
+      .mutation(async ({ ctx, input }) => {
+        const contact = await createContact({
+          ...input,
+          email: input.email || null,
+        });
 
-      recordUserActivity({
-        userId: ctx.user.id,
-        userName: ctx.user.name,
-        action: "Created",
-        entityType: "Contact",
-        entityTitle: contact.contactName,
-        details: `Added contact ${contact.contactName} (${contact.roleDepartment}) for ${contact.companyName}`,
-      });
+        recordUserActivity({
+          userId: ctx.user.id,
+          userName: ctx.user.name,
+          action: "Created",
+          entityType: "Contact",
+          entityTitle: contact.contactName,
+          details: `Added contact ${contact.contactName} (${contact.roleDepartment}) for ${contact.companyName}`,
+        });
 
-      return contact;
-    }),
+        return contact;
+      }),
 
     update: protectedProcedure
       .input(
@@ -354,6 +522,7 @@ export const appRouter = router({
           entityTitle: `Contact #${input.id}`,
           details: `Deleted contact record`,
         });
+
         return deleteContact(input.id);
       }),
   }),
@@ -371,28 +540,39 @@ export const appRouter = router({
           })
           .optional()
       )
-      .query(({ input }) => listContactLogs(input?.sponsorId, input?.search)),
+      .query(({ input }) =>
+        listContactLogs(input?.sponsorId, input?.search)
+      ),
 
-    create: protectedProcedure.input(contactLogInput).mutation(async ({ ctx, input }) => {
-      const log = await createContactLog({
-        ...input,
-        logDate: input.logDate ? new Date(input.logDate) : new Date(),
-        nextFollowupDate: input.nextFollowupDate ? new Date(input.nextFollowupDate) : null,
-        teamMember: input.teamMember ?? ctx.user.id,
-        loggedBy: ctx.user.id,
-      });
+    create: protectedProcedure
+      .input(contactLogInput)
+      .mutation(async ({ ctx, input }) => {
+        const log = await createContactLog({
+          ...input,
+          logDate: input.logDate
+            ? new Date(input.logDate)
+            : new Date(),
+          nextFollowupDate: input.nextFollowupDate
+            ? new Date(input.nextFollowupDate)
+            : null,
+          teamMember: input.teamMember ?? ctx.user.id,
+          loggedBy: ctx.user.id,
+        });
 
-      recordUserActivity({
-        userId: ctx.user.id,
-        userName: ctx.user.name,
-        action: "Created",
-        entityType: "Outreach",
-        entityTitle: `${log.companyName} (${log.contactMethod})`,
-        details: `Logged outreach interaction: ${log.interactionSummary.substring(0, 50)}...`,
-      });
+        recordUserActivity({
+          userId: ctx.user.id,
+          userName: ctx.user.name,
+          action: "Created",
+          entityType: "Outreach",
+          entityTitle: `${log.companyName} (${log.contactMethod})`,
+          details: `Logged outreach interaction: ${log.interactionSummary.substring(
+            0,
+            50
+          )}...`,
+        });
 
-      return log;
-    }),
+        return log;
+      }),
 
     update: protectedProcedure
       .input(
@@ -404,8 +584,12 @@ export const appRouter = router({
       .mutation(async ({ ctx, input }) => {
         const updated = await updateContactLog(input.id, {
           ...input.data,
-          logDate: input.data.logDate ? new Date(input.data.logDate) : undefined,
-          nextFollowupDate: input.data.nextFollowupDate ? new Date(input.data.nextFollowupDate) : undefined,
+          logDate: input.data.logDate
+            ? new Date(input.data.logDate)
+            : undefined,
+          nextFollowupDate: input.data.nextFollowupDate
+            ? new Date(input.data.nextFollowupDate)
+            : undefined,
         });
 
         recordUserActivity({
@@ -424,6 +608,7 @@ export const appRouter = router({
       .input(z.object({ id: z.number() }))
       .mutation(async ({ ctx, input }) => {
         const toggled = await toggleLogFollowupComplete(input.id);
+
         recordUserActivity({
           userId: ctx.user.id,
           userName: ctx.user.name,
@@ -434,6 +619,7 @@ export const appRouter = router({
             ? `Marked outreach follow-up as completed`
             : `Re-opened outreach follow-up item`,
         });
+
         return toggled;
       }),
 
@@ -448,6 +634,7 @@ export const appRouter = router({
           entityTitle: `Outreach Log #${input.id}`,
           details: `Deleted outreach log entry`,
         });
+
         return deleteContactLog(input.id);
       }),
   }),
@@ -465,32 +652,46 @@ export const appRouter = router({
           })
           .optional()
       )
-      .query(({ input }) => listOffers(input?.sponsorId, input?.search)),
+      .query(({ input }) =>
+        listOffers(input?.sponsorId, input?.search)
+      ),
 
-    create: protectedProcedure.input(offerInput).mutation(async ({ ctx, input }) => {
-      const offer = await createOffer({
-        ...input,
-        cashValue: input.cashValue.toString(),
-        inKindValue: input.inKindValue.toString(),
-        amountReceived: input.amountReceived.toString(),
-        offerDate: input.offerDate ? new Date(input.offerDate) : new Date(),
-        invoiceDate: input.invoiceDate ? new Date(input.invoiceDate) : null,
-        paymentDate: input.paymentDate ? new Date(input.paymentDate) : null,
-        activationDeadline: input.activationDeadline ? new Date(input.activationDeadline) : null,
-        ownerId: input.ownerId ?? ctx.user.id,
-      });
+    create: protectedProcedure
+      .input(offerInput)
+      .mutation(async ({ ctx, input }) => {
+        const offer = await createOffer({
+          ...input,
+          cashValue: input.cashValue.toString(),
+          inKindValue: input.inKindValue.toString(),
+          amountReceived: input.amountReceived.toString(),
+          offerDate: input.offerDate
+            ? new Date(input.offerDate)
+            : new Date(),
+          invoiceDate: input.invoiceDate
+            ? new Date(input.invoiceDate)
+            : null,
+          paymentDate: input.paymentDate
+            ? new Date(input.paymentDate)
+            : null,
+          activationDeadline: input.activationDeadline
+            ? new Date(input.activationDeadline)
+            : null,
+          ownerId: input.ownerId ?? ctx.user.id,
+        });
 
-      recordUserActivity({
-        userId: ctx.user.id,
-        userName: ctx.user.name,
-        action: "Created",
-        entityType: "Deal",
-        entityTitle: `${offer.offerType} — ${offer.companyName}`,
-        details: `Created commercial deal valued at ₹${Number(offer.totalValue || 0).toLocaleString("en-IN")}`,
-      });
+        recordUserActivity({
+          userId: ctx.user.id,
+          userName: ctx.user.name,
+          action: "Created",
+          entityType: "Deal",
+          entityTitle: `${offer.offerType} — ${offer.companyName}`,
+          details: `Created commercial deal valued at ₹${Number(
+            offer.totalValue || 0
+          ).toLocaleString("en-IN")}`,
+        });
 
-      return offer;
-    }),
+        return offer;
+      }),
 
     update: protectedProcedure
       .input(
@@ -502,13 +703,30 @@ export const appRouter = router({
       .mutation(async ({ ctx, input }) => {
         const updated = await updateOffer(input.id, {
           ...input.data,
-          cashValue: input.data.cashValue != null ? input.data.cashValue.toString() : undefined,
-          inKindValue: input.data.inKindValue != null ? input.data.inKindValue.toString() : undefined,
-          amountReceived: input.data.amountReceived != null ? input.data.amountReceived.toString() : undefined,
-          offerDate: input.data.offerDate ? new Date(input.data.offerDate) : undefined,
-          invoiceDate: input.data.invoiceDate ? new Date(input.data.invoiceDate) : undefined,
-          paymentDate: input.data.paymentDate ? new Date(input.data.paymentDate) : undefined,
-          activationDeadline: input.data.activationDeadline ? new Date(input.data.activationDeadline) : undefined,
+          cashValue:
+            input.data.cashValue != null
+              ? input.data.cashValue.toString()
+              : undefined,
+          inKindValue:
+            input.data.inKindValue != null
+              ? input.data.inKindValue.toString()
+              : undefined,
+          amountReceived:
+            input.data.amountReceived != null
+              ? input.data.amountReceived.toString()
+              : undefined,
+          offerDate: input.data.offerDate
+            ? new Date(input.data.offerDate)
+            : undefined,
+          invoiceDate: input.data.invoiceDate
+            ? new Date(input.data.invoiceDate)
+            : undefined,
+          paymentDate: input.data.paymentDate
+            ? new Date(input.data.paymentDate)
+            : undefined,
+          activationDeadline: input.data.activationDeadline
+            ? new Date(input.data.activationDeadline)
+            : undefined,
         });
 
         recordUserActivity({
@@ -534,6 +752,7 @@ export const appRouter = router({
           entityTitle: `Deal Agreement #${input.id}`,
           details: `Deleted sponsorship deal record`,
         });
+
         return deleteOffer(input.id);
       }),
   }),
