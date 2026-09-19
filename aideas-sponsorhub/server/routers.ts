@@ -23,7 +23,6 @@ import {
   getSponsorKpis,
   getUserActivities,
   getUserByEmail,
-  getUserById,
   globalSearch,
   inviteTeamMember,
   listContactLogs,
@@ -150,153 +149,39 @@ export const appRouter = router({
 
     login: publicProcedure
       .input(
-        z
-          .object({
-            email: z.string().optional(),
-            userId: z.number().optional(),
-            role: z.enum(["admin", "user"]).optional(),
-          })
-          .optional()
+        z.object({
+          accessToken: z.string().min(1),
+        })
       )
       .mutation(async ({ ctx, input }) => {
-        let userToAuth: any = null;
+        // Verify the Supabase access token on the server.
+        const {
+          data: { user: supabaseUser },
+          error,
+        } = await supabase.auth.getUser(input.accessToken);
 
-        // --------------------------------------------------
-        // CASE 1: Quick-login using an existing SponsorHub
-        // user ID.
-        //
-        // We STILL verify that this user's email exists in
-        // Supabase Authentication. This prevents the
-        // quick-login buttons from bypassing the rule.
-        // --------------------------------------------------
-        if (input?.userId) {
-          userToAuth = await getUserById(input.userId);
+        if (error || !supabaseUser || !supabaseUser.email) {
+          console.error("Supabase session verification failed:", error);
 
-          if (!userToAuth) {
-            throw new TRPCError({
-              code: "UNAUTHORIZED",
-              message: "User account not found",
-            });
-          }
-
-          if (!userToAuth.email) {
-            throw new TRPCError({
-              code: "UNAUTHORIZED",
-              message: "This user does not have an email address",
-            });
-          }
-
-          const { data, error } = await supabase.auth.admin.listUsers({
-            page: 1,
-            perPage: 1000,
+          throw new TRPCError({
+            code: "UNAUTHORIZED",
+            message: "Your sign-in link is invalid or has expired",
           });
-
-          if (error) {
-            console.error("Supabase Auth verification failed:", error);
-
-            throw new TRPCError({
-              code: "INTERNAL_SERVER_ERROR",
-              message: "Unable to verify account",
-            });
-          }
-
-          const supabaseUser = data.users.find(
-            (user) =>
-              user.email?.toLowerCase() === userToAuth.email.toLowerCase()
-          );
-
-          if (!supabaseUser) {
-            throw new TRPCError({
-              code: "UNAUTHORIZED",
-              message: "This email is not authorized to access SponsorHub",
-            });
-          }
         }
 
-        // --------------------------------------------------
-        // CASE 2: Login using an email address.
-        //
-        // FIRST check Supabase Authentication.
-        // Only users whose email exists in Supabase Auth
-        // are allowed to continue.
-        // --------------------------------------------------
-        else if (input?.email) {
-          const email = input.email.trim().toLowerCase();
+        const email = supabaseUser.email.trim().toLowerCase();
 
-          const { data, error } = await supabase.auth.admin.listUsers({
-            page: 1,
-            perPage: 1000,
-          });
+        // Check whether this verified Supabase email
+        // is authorized in the SponsorHub database.
+        const userToAuth = await getUserByEmail(email);
 
-          if (error) {
-            console.error("Supabase Auth verification failed:", error);
-
-            throw new TRPCError({
-              code: "INTERNAL_SERVER_ERROR",
-              message: "Unable to verify account",
-            });
-          }
-
-          const supabaseUser = data.users.find(
-            (user) => user.email?.toLowerCase() === email
-          );
-
-          // Email does NOT exist in Supabase Auth.
-          if (!supabaseUser) {
-            throw new TRPCError({
-              code: "UNAUTHORIZED",
-              message: "This email is not authorized to access SponsorHub",
-            });
-          }
-
-          // --------------------------------------------------
-          // Supabase Auth has verified the email.
-          //
-          // Now find the corresponding SponsorHub profile.
-          // --------------------------------------------------
-          userToAuth = await getUserByEmail(email);
-
-          // --------------------------------------------------
-          // If this is the first time this authorized
-          // Supabase user is accessing SponsorHub, create
-          // their SponsorHub profile automatically.
-          // --------------------------------------------------
-          if (!userToAuth) {
-            const nameFromEmail = email
-              .split("@")[0]
-              .replace(/[._-]/g, " ")
-              .trim();
-
-            const formattedName = nameFromEmail
-              .split(" ")
-              .filter(Boolean)
-              .map(
-                (part) =>
-                  part.charAt(0).toUpperCase() + part.slice(1).toLowerCase()
-              )
-              .join(" ");
-
-            userToAuth = await inviteTeamMember({
-              name: formattedName || email.split("@")[0],
-              email,
-              role: input.role ?? "user",
-            });
-          }
-        }
-
-        // --------------------------------------------------
-        // No usable login information was supplied.
-        // --------------------------------------------------
         if (!userToAuth) {
           throw new TRPCError({
             code: "UNAUTHORIZED",
-            message: "Please provide an authorized email address",
+            message: "This email is not authorized to access SponsorHub",
           });
         }
 
-        // --------------------------------------------------
-        // Create SponsorHub session cookie.
-        // --------------------------------------------------
         const cookiePayload = {
           id: userToAuth.id,
           name: userToAuth.name,

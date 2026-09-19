@@ -1,4 +1,5 @@
 import { trpc } from "@/lib/trpc";
+import { supabase } from "@/lib/supabase";
 import { TRPCClientError } from "@trpc/client";
 import { useCallback, useEffect, useMemo } from "react";
 
@@ -24,6 +25,15 @@ export function useAuth(options?: UseAuthOptions) {
 
   const logout = useCallback(async () => {
     try {
+      // Sign out from Supabase first so the magic-link session
+      // cannot immediately authenticate us again.
+      await supabase.auth.signOut();
+    } catch (error) {
+      console.error("Supabase logout failed:", error);
+    }
+
+    try {
+      // Clear the SponsorHub backend session/cookie.
       await logoutMutation.mutateAsync();
     } catch (error: unknown) {
       if (
@@ -32,6 +42,7 @@ export function useAuth(options?: UseAuthOptions) {
       ) {
         return;
       }
+
       throw error;
     } finally {
       utils.auth.me.setData(undefined, null);
