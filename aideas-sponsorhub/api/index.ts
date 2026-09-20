@@ -1,5 +1,6 @@
-import { createApp } from "../server/_core/app.js";
-
-const app = createApp();
-
-export default app;
+export default function handler(req: any, res: any) {
+  res.status(200).json({
+    ok: true,
+    message: "Vercel API function is working",
+  });
+}
