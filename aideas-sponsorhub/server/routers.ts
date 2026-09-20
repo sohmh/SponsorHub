@@ -450,10 +450,9 @@ export const appRouter = router({
           action: "Created",
           entityType: "Outreach",
           entityTitle: `${log.companyName} (${log.contactMethod})`,
-          details: `Logged outreach interaction: ${log.interactionSummary.substring(
-            0,
-            50
-          )}...`,
+          details: `Logged outreach interaction: ${
+            log.interactionSummary?.substring(0, 50) ?? ""
+          }...`,
         });
 
         return log;
